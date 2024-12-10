@@ -1,104 +1,42 @@
 import os
-import ollama
-import fitz  # PyMuPDF để đọc PDF
+import glob
+import PyPDF2
+import requests
+from typing import List, Dict, Any
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+# from langchain.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
+
+from langchain_community.vectorstores import FAISS
+from langchain.docstore.document import Document
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Tuple
 
-# Khởi tạo FastAPI app
-app = FastAPI()
+
+from fastapi.middleware.cors import CORSMiddleware
+
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Thêm middleware CORS
+app = FastAPI()
+
+origins = [
+    "http://localhost:5173",  # URL của frontend của bạn
+    "http://localhost",
+    # Thêm các nguồn cần thiết khác
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Chấp nhận tất cả các domain
+    allow_origins=origins,  # Cho phép frontend của bạn
     allow_credentials=True,
-    allow_methods=["*"],  # Chấp nhận tất cả các phương thức HTTP
-    allow_headers=["*"],  # Chấp nhận tất cả các header
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-
-EMBEDDING_MODEL = 'hf.co/CompendiumLabs/bge-base-en-v1.5-gguf'
-LANGUAGE_MODEL = 'hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF'
-
-VECTOR_DB = []  # Đây là cơ sở dữ liệu chứa các vector đã được tạo ra
-
-# Đọc và trích xuất văn bản từ file PDF
-def extract_text_from_pdf(pdf_path):
-    doc = fitz.open(pdf_path)
-    text = ""
-    for page in doc:
-        text += page.get_text()
-    return text
-
-# Thêm chunk và đường dẫn vào VECTOR_DB
-def add_chunk_to_database(chunk, file_path):
-    embedding = ollama.embed(model=EMBEDDING_MODEL, input=chunk)['embeddings'][0]  # Lấy embedding của chunk
-    VECTOR_DB.append((chunk, embedding, file_path))  # Lưu vào cơ sở dữ liệu
-
-# Đọc các file PDF trong thư mục và thêm nội dung vào VECTOR_DB
-pdf_directory = r"D:\Project2\data\test"  # Đường dẫn thư mục chứa file PDF
-for pdf_file in os.listdir(pdf_directory):
-    if pdf_file.endswith(".pdf"):
-        pdf_path = os.path.join(pdf_directory, pdf_file)
-        text = extract_text_from_pdf(pdf_path)  # Trích xuất văn bản từ PDF
-        for i, chunk in enumerate(text.split("\n")):  # Tách văn bản thành các đoạn nhỏ
-            if chunk.strip():  # Nếu dòng không rỗng
-                add_chunk_to_database(chunk, pdf_path)  # Thêm vào VECTOR_DB
-                print(f'Added chunk {i+1} from {pdf_file} to the database')
-
-# Hàm tính độ tương đồng cosine giữa hai vector
-def cosine_similarity(a, b):
-    dot_product = sum([x * y for x, y in zip(a, b)])
-    norm_a = sum([x ** 2 for x in a]) ** 0.5
-    norm_b = sum([x ** 2 for x in b]) ** 0.5
-    return dot_product / (norm_a * norm_b)  # Trả về độ tương đồng cosine
-
-# Hàm retrieve sẽ trả về cả chunk và đường dẫn file
-def retrieve(query, top_n=3):
-    query_embedding = ollama.embed(model=EMBEDDING_MODEL, input=query)['embeddings'][0]  # Lấy embedding của câu hỏi
-    similarities = []
-    
-    for chunk, embedding, file_path in VECTOR_DB:
-        similarity = cosine_similarity(query_embedding, embedding)  # Tính độ tương đồng cosine
-        similarities.append((chunk, similarity, file_path))  # Lưu vào danh sách tương đồng
-    
-    similarities.sort(key=lambda x: x[1], reverse=True)  # Sắp xếp theo độ tương đồng giảm dần
-    return similarities[:top_n]  # Trả về top_n kết quả có độ tương đồng cao nhất
-
-# Cải thiện prompt chỉ dẫn
-def create_instruction_prompt(retrieved_knowledge):
-    instruction_prompt = f'''
-    Bạn là một trợ lý thông minh, giúp tôi trả lời câu hỏi về các thông tin trong CV. 
-    Dưới đây là các thông tin từ các CV mà bạn cần sử dụng để trả lời câu hỏi. Hãy chỉ sử dụng thông tin này để trả lời câu hỏi, không tạo ra thông tin mới.
-    '''
-    instruction_prompt += '\n'.join([f' - {chunk} (from: {file_path})' for chunk, similarity, file_path in retrieved_knowledge])  # Thêm thông tin các đoạn đã tìm thấy
-    instruction_prompt += '''
-    Chỉ sử dụng các thông tin trên để trả lời câu hỏi. Đừng tạo ra thông tin mới.
-    '''
-    return instruction_prompt
-
-# Hàm tương tác với chatbot
-def chat_with_bot(input_query, instruction_prompt):
-    stream = ollama.chat(
-        model=LANGUAGE_MODEL,
-        messages=[{'role': 'system', 'content': instruction_prompt},
-                  {'role': 'user', 'content': input_query}],
-        stream=True,
-    )
-    
-    response = ""
-    for chunk in stream:
-        message_content = chunk['message']['content']
-        response += message_content  # Xây dựng câu trả lời từ chatbot
-    
-    return response
-
-# Pydantic model để yêu cầu dữ liệu từ người dùng
 class QueryRequest(BaseModel):
     query: str
+
 
 class RetrievedKnowledge(BaseModel):
     chunk: str
@@ -108,160 +46,165 @@ class RetrievedKnowledge(BaseModel):
 class ChatResponse(BaseModel):
     response: str
 
-# API endpoint cho việc nhận câu hỏi và trả về kết quả
-@app.post("/retrieve/")
-async def retrieve_information(request: QueryRequest):
-    input_query = request.query  # Nhận câu hỏi từ người dùng
-    # Lấy thông tin đã truy xuất từ cơ sở dữ liệu
-    retrieved_knowledge = retrieve(input_query)
+# Các hàm xử lý giống như trước
+def load_pdfs(folder_path: str) -> List[Dict[str, Any]]:
+    pdf_docs = []
+    unique_files = set()
+    for file in glob.glob(os.path.join(folder_path, "*.pdf")):
+        try:
+            if file in unique_files:
+                continue
+            unique_files.add(file)
+            
+            with open(file, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                text = " ".join([page.extract_text() for page in reader.pages if page.extract_text()])
+                pdf_docs.append({
+                    "text": text,
+                    "file_path": file
+                })
+        except Exception as e:
+            print(f"Lỗi xử lý tệp {file}: {e}")
+    return pdf_docs
+
+
+def chunk_documents(pdf_docs: List[Dict[str, Any]], chunk_size=500, chunk_overlap=100) :#-> List[Document]:
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, 
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", " ", ""]
+    )
     
-    # Tạo prompt chỉ dẫn cho chatbot
-    instruction_prompt = create_instruction_prompt(retrieved_knowledge)
+    documents = []
+    for doc in pdf_docs:
+        chunks = text_splitter.split_text(doc["text"])
+        for chunk in chunks:
+            documents.append(Document(
+                page_content=chunk, 
+                metadata={
+                    "file_path": doc["file_path"], 
+                    "full_text": doc["text"]
+                }
+            ))
+    return documents
+
+
+def create_vectorstore(documents: List[Document], embedding_model: HuggingFaceEmbeddings) -> FAISS:
+    return FAISS.from_documents(documents, embedding_model)
+
+
+def search_candidates(query: str, vectorstore: FAISS, top_k: int = 2):#-> List[Dict[str, str]]:
+    retriever = vectorstore.as_retriever(search_kwargs={"k": top_k})
+    # results = retriever.get_relevant_documents(query)
+    results = retriever.invoke(query)
+
     
-    # Gọi hàm để chatbot trả lời
-    response = chat_with_bot(input_query, instruction_prompt)
+    unique_results = []
+    seen_paths = set()
+    for doc in results:
+        if doc.metadata["file_path"] not in seen_paths:
+            unique_results.append({
+                "file_path": doc.metadata["file_path"], 
+                "context": doc.metadata["full_text"]
+            })
+            seen_paths.add(doc.metadata["file_path"])
     
-    # Trả về kết quả dưới dạng JSON
-    return ChatResponse(response=response)
-
-@app.get("/pdf_info/")
-async def get_pdf_info():
-    # Trả về danh sách các file đã được thêm vào VECTOR_DB
-    return [RetrievedKnowledge(chunk=chunk[:200], similarity=similarity, file_path=file_path)
-            for chunk, similarity, file_path in VECTOR_DB]
+    return unique_results
 
 
-# import os
-# import ollama
-# import fitz  # PyMuPDF để đọc PDF
-# from fastapi import FastAPI, HTTPException
-# from pydantic import BaseModel
-# from typing import List, Tuple
-
-# # Khởi tạo FastAPI app
-# app = FastAPI()
-
-# from fastapi import FastAPI
-# from fastapi.middleware.cors import CORSMiddleware
-
-# # Thêm middleware CORS
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],  # Chấp nhận tất cả các domain
-#     allow_credentials=True,
-#     allow_methods=["*"],  # Chấp nhận tất cả các phương thức HTTP
-#     allow_headers=["*"],  # Chấp nhận tất cả các header
-# )
-
-
-
-
-# EMBEDDING_MODEL = 'hf.co/CompendiumLabs/bge-base-en-v1.5-gguf'
-# LANGUAGE_MODEL = 'hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF'
-
-# VECTOR_DB = []  # Đây là cơ sở dữ liệu chứa các vector đã được tạo ra
-
-# # Đọc và trích xuất văn bản từ file PDF
-# def extract_text_from_pdf(pdf_path):
-#     doc = fitz.open(pdf_path)
-#     text = ""
-#     for page in doc:
-#         text += page.get_text()
-#     return text
-
-# # Thêm chunk và đường dẫn vào VECTOR_DB
-# def add_chunk_to_database(chunk, file_path):
-#     embedding = ollama.embed(model=EMBEDDING_MODEL, input=chunk)['embeddings'][0]  # Lấy embedding của chunk
-#     VECTOR_DB.append((chunk, embedding, file_path))  # Lưu vào cơ sở dữ liệu
-
-# # Đọc các file PDF trong thư mục và thêm nội dung vào VECTOR_DB
-# pdf_directory = r"D:\Project2\data\test"  # Đường dẫn thư mục chứa file PDF
-# for pdf_file in os.listdir(pdf_directory):
-#     if pdf_file.endswith(".pdf"):
-#         pdf_path = os.path.join(pdf_directory, pdf_file)
-#         text = extract_text_from_pdf(pdf_path)  # Trích xuất văn bản từ PDF
-#         for i, chunk in enumerate(text.split("\n")):  # Tách văn bản thành các đoạn nhỏ
-#             if chunk.strip():  # Nếu dòng không rỗng
-#                 add_chunk_to_database(chunk, pdf_path)  # Thêm vào VECTOR_DB
-#                 print(f'Added chunk {i+1} from {pdf_file} to the database')
-
-# # Hàm tính độ tương đồng cosine giữa hai vector
-# def cosine_similarity(a, b):
-#     dot_product = sum([x * y for x, y in zip(a, b)])
-#     norm_a = sum([x ** 2 for x in a]) ** 0.5
-#     norm_b = sum([x ** 2 for x in b]) ** 0.5
-#     return dot_product / (norm_a * norm_b)  # Trả về độ tương đồng cosine
-
-# # Hàm retrieve sẽ trả về cả chunk và đường dẫn file
-# def retrieve(query, top_n=3):
-#     query_embedding = ollama.embed(model=EMBEDDING_MODEL, input=query)['embeddings'][0]  # Lấy embedding của câu hỏi
-#     similarities = []
+def generate_response(query: str, context: str, together_api_key: str, together_model: str):# -> str:
+    if not together_api_key:
+        raise ValueError("Khóa API Together.ai là bắt buộc")
     
-#     for chunk, embedding, file_path in VECTOR_DB:
-#         similarity = cosine_similarity(query_embedding, embedding)  # Tính độ tương đồng cosine
-#         similarities.append((chunk, similarity, file_path))  # Lưu vào danh sách tương đồng
+    headers = {
+        "Authorization": f"Bearer {together_api_key}",
+        "Content-Type": "application/json"
+    }
     
-#     similarities.sort(key=lambda x: x[1], reverse=True)  # Sắp xếp theo độ tương đồng giảm dần
-#     return similarities[:top_n]  # Trả về top_n kết quả có độ tương đồng cao nhất
-
-# # Cải thiện prompt chỉ dẫn
-# def create_instruction_prompt(retrieved_knowledge):
-#     instruction_prompt = f'''
-#     Bạn là một trợ lý thông minh, giúp tôi trả lời câu hỏi về các thông tin trong CV. 
-#     Dưới đây là các thông tin từ các CV mà bạn cần sử dụng để trả lời câu hỏi. Hãy chỉ sử dụng thông tin này để trả lời câu hỏi, không tạo ra thông tin mới.
-#     '''
-#     instruction_prompt += '\n'.join([f' - {chunk} (from: {file_path})' for chunk, similarity, file_path in retrieved_knowledge])  # Thêm thông tin các đoạn đã tìm thấy
-#     instruction_prompt += '''
-#     Chỉ sử dụng các thông tin trên để trả lời câu hỏi. Đừng tạo ra thông tin mới.
-#     '''
-#     return instruction_prompt
-
-# # Hàm tương tác với chatbot
-# def chat_with_bot(input_query, instruction_prompt):
-#     stream = ollama.chat(
-#         model=LANGUAGE_MODEL,
-#         messages=[{'role': 'system', 'content': instruction_prompt},
-#                   {'role': 'user', 'content': input_query}],
-#         stream=True,
-#     )
+    payload = {
+        "model": together_model,
+        "prompt": f"""Bạn là một chatbot AI có khả năng tìm kiếm và đưa ra thông tin của ứng viên phù hợp, dựa trên toàn bộ bối cảnh CV ứng viên được tìm thấy sau đây, hãy đưa ra phân tích và trả lời ý kiến của bạn câu truy vấn một cách chi tiết và chính xác:
     
-#     response = ""
-#     for chunk in stream:
-#         message_content = chunk['message']['content']
-#         response += message_content  # Xây dựng câu trả lời từ chatbot
+        Bối cảnh CV: {context}
+        Câu truy vấn: {query}
+
+        Trả lời chi tiết bằng tiếng Việt:""",
+        "max_tokens": 500,
+        "temperature": 0.7
+    }
     
-#     return response
-
-# # Pydantic model để yêu cầu dữ liệu từ người dùng
-# class QueryRequest(BaseModel):
-#     query: str
-
-# class RetrievedKnowledge(BaseModel):
-#     chunk: str
-#     similarity: float
-#     file_path: str
-
-# class ChatResponse(BaseModel):
-#     response: str
-
-# # API endpoint cho việc nhận câu hỏi và trả về kết quả
-# @app.post("/retrieve/")
-# async def retrieve_information(request: QueryRequest):
-#     input_query = request.query  # Nhận câu hỏi từ người dùng
-#     # Lấy thông tin đã truy xuất từ cơ sở dữ liệu
-#     retrieved_knowledge = retrieve(input_query)
+    try:
+        response = requests.post(
+            "https://api.together.xyz/v1/completions", 
+            headers=headers, 
+            json=payload
+        )
+        
+        response_data = response.json()
+        # print(response_data)
+        if 'choices' in response_data and len(response_data['choices']) > 0:
+            print(response_data['choices'][0]['text'].strip())
+            return response_data['choices'][0]['text'].strip()
+        elif 'output' in response_data:
+            print(response_data['output'].strip())
+            return response_data['output'].strip()
+        else:
+            return "Không tìm thấy thông tin phù hợp với truy vấn."
     
-#     # Tạo prompt chỉ dẫn cho chatbot
-#     instruction_prompt = create_instruction_prompt(retrieved_knowledge)
-    
-#     # Gọi hàm để chatbot trả lời
-#     response = chat_with_bot(input_query, instruction_prompt)
-    
-#     # Trả về kết quả dưới dạng JSON
-#     return ChatResponse(response=response)
+    except requests.RequestException as e:
+        return f"Lỗi kết nối: {e}"
+    except Exception as e:
+        return f"Lỗi không xác định: {e}"
 
-# @app.get("/pdf_info/")
-# async def get_pdf_info():
-#     # Trả về danh sách các file đã được thêm vào VECTOR_DB
-#     return [RetrievedKnowledge(chunk=chunk[:200], similarity=similarity, file_path=file_path)
-#             for chunk, similarity, file_path in VECTOR_DB]
+
+def process_search(query: str, vectorstore: FAISS, together_api_key: str, together_model: str):# -> List[Dict[str, str]]:
+    matched_candidates = search_candidates(query, vectorstore)
+    
+    results = []
+    for candidate in matched_candidates:
+        try:
+            response = generate_response(query, candidate['context'], together_api_key, together_model)
+            
+            results.append({
+                "file_path": candidate['file_path'],
+                "response": response + f"\n\n🔗 Đường dẫn CV: {candidate['file_path']}"
+            })
+        except Exception as e:
+            print(f"Lỗi xử lý tệp {candidate['file_path']}: {e}")
+    
+    return results
+
+
+# Pydantic model for input request
+class QueryRequest(BaseModel):
+    query: str
+
+
+# API endpoints
+@app.post("/search")
+async def search(query_request: QueryRequest):
+    query = query_request.query
+    folder_path = "D:\\Project2\\data\\test"
+    embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2", model_kwargs={"device": "cpu"}, encode_kwargs={"normalize_embeddings": True})
+    together_api_key = "eca0b727abc5861fdcb4ea8bfcad9e1c165fd552cf1b70859350cad33ba8e15d"
+    # together_model = "meta-llama/Llama-2-7b-chat-hf"
+    together_model = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    
+    
+    # Load and process documents
+    pdf_docs = load_pdfs(folder_path)
+    documents = chunk_documents(pdf_docs)
+    vectorstore = create_vectorstore(documents, embedding_model)
+    
+    # Process search
+    results = process_search(query, vectorstore, together_api_key, together_model)
+    
+    if results:
+        return {"results": results}
+    else:
+        raise HTTPException(status_code=404, detail="Không tìm thấy kết quả phù hợp.")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

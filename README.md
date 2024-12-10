@@ -1,6 +1,0 @@
-# Backend-api-chatbot-ollam7B
-
-# Lệnh chạy server
-uvicorn api:app --reload   
-
-uvicorn test:app --reload
